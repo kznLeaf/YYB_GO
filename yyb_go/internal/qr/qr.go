@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,6 +20,21 @@ import (
 )
 
 const (
+	// 应用宝的认证和鉴权URL
+	//
+	// - 触发回调：当用户在手机上微信扫码并点击“确认登录”后，微信长轮询会返回一个临时的 AuthorizeCode
+	//
+	// - 请求兑换：代码中的 GetLoginBuffer 方法会构造一个请求，携带code访问
+	// https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX&code=...
+	//
+	// - 下发凭证 (Cookie)：这个接口在验证 code 有效后，会在 HTTP 响应中通过 Set-Cookie
+	// 头部下发一系列关键的身份凭证，包括 openid、accesstoken、refreshtoken 和 nickname 等。
+	//
+	// - 提取并构建会话：credentialsFromJar 函数会从 cookie 中精准提取这些 Cookie，
+	// 并将其组装成 protocol.LoginBufferCredentials 结构体。
+	//
+	// - 获取最终登录态：最后，代码使用这些凭证去调用底层的 FetchLoginBuffer，换取最终的 LoginBuffer
+	// （这通常是腾讯 PC 客户端内部协议用于维持长连接登录态的核心 Token）。
 	oauthURL = "https://open.weixin.qq.com/connect/qrconnect" +
 		"?appid=wxd44977328b36e647" +
 		"&redirect_uri=https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX" +
@@ -30,17 +46,29 @@ const (
 )
 
 var (
+	// uuidRE 获取二维码的UUID
+	// e.g. <img src="/connect/qrcode/041a2b3c4d5e6f7g" />
+	// -> 041a2b3c4d5e6f7g
 	uuidRE = regexp.MustCompile(`/connect/qrcode/([^"'>\s]+)`)
-	errRE  = regexp.MustCompile(`wx_errcode\s*=\s*(\d+)`)
+	// errRE match status code.
+	// e.g. window.wx_errcode = 405; -> 405
+	errRE = regexp.MustCompile(`wx_errcode\s*=\s*(\d+)`)
+	// codeRE 提取登录返回的code.
+	// window.wx_code='XXX';
 	codeRE = regexp.MustCompile(`wx_code\s*=\s*'([^']*)'`)
 )
 
 type Session struct {
-	ID            string
-	WXUUID        string
-	QRCodeURL     string
-	CreatedAt     time.Time
-	HTTPClient    *http.Client
+	ID     string
+	WXUUID string
+	// QRCodeURL is fixed to qrBase + wxuuid
+	//
+	// i.e. "https://open.weixin.qq.com/connect/qrcode/{wxuuid}"
+	QRCodeURL  string
+	CreatedAt  time.Time
+	HTTPClient *http.Client
+	// Jar 是 Cookie 的实现。应用宝的登录接口在成功登录后通过 Cookie
+	// 返回 token 等信息，所以需要这个字段
 	Jar           http.CookieJar
 	AuthorizeCode string
 	Credentials   *protocol.LoginBufferCredentials
@@ -50,6 +78,7 @@ type Session struct {
 	mu            sync.Mutex
 }
 
+// Age 返回 Session 创建至今经过的时间。
 func (s *Session) Age() time.Duration { return time.Since(s.CreatedAt) }
 
 type ImageResult struct {
@@ -69,6 +98,8 @@ type Client struct {
 	loginBuffers *protocol.LoginBufferClient
 }
 
+// NewClient 创建并返回一个新的 Client 实例，用于处理微信扫码登录流程，
+// 同时初始化底层的 LoginBufferClient。
 func NewClient(timeout time.Duration) *Client {
 	return &Client{
 		timeout:      timeout,
@@ -76,8 +107,12 @@ func NewClient(timeout time.Duration) *Client {
 	}
 }
 
+// LoginBuffers 返回客户端内部使用的 LoginBufferClient 实例，
+// 供外部需要直接操作底层登录缓冲协议时调用。
 func (c *Client) LoginBuffers() *protocol.LoginBufferClient { return c.loginBuffers }
 
+// GetQRCodeImage 创建一个新的登录会话，并获取对应的二维码图片原始字节数据。
+// 这是一个组合方法，封装了 CreateSession 和 FetchQRCodeImage 的调用。
 func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 	sess, err := c.CreateSession(ctx)
 	if err != nil {
@@ -90,12 +125,16 @@ func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 	return ImageResult{Session: sess, ImageBytes: data}, nil
 }
 
+// CreateSession 创建一个新的登录会话。它会向微信服务器发起请求以获取二维码的唯一 UUID，
+// 并配置带有独立 CookieJar 的 HTTP 客户端，以维持该会话的后续状态和请求。
 func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
+
 	hc := &http.Client{Timeout: c.timeout, Jar: jar}
+	// 访问应用宝的认证和鉴权URL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauthURL, nil)
 	if err != nil {
 		return nil, err
@@ -106,6 +145,7 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	body, _ := io.ReadAll(resp.Body)
 	m := uuidRE.FindStringSubmatch(string(body))
 	if len(m) < 2 {
@@ -115,7 +155,9 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// qrcode uuid
 	wxuuid := m[1]
+	log.Printf("QRcode UUID(wxuuid): %s\n", wxuuid)
 	return &Session{
 		ID:         id,
 		WXUUID:     wxuuid,
@@ -127,6 +169,7 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	}, nil
 }
 
+// FetchQRCodeImage 根据会话中存储的二维码 URL，向微信服务器请求并下载二维码图片的原始字节数据。
 func (c *Client) FetchQRCodeImage(ctx context.Context, sess *Session) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sess.QRCodeURL, nil)
 	if err != nil {
@@ -143,6 +186,9 @@ func (c *Client) FetchQRCodeImage(ctx context.Context, sess *Session) ([]byte, e
 	return io.ReadAll(resp.Body)
 }
 
+// PollQRCode 通过长轮询机制检查当前会话的扫码状态（用户完成扫码动作需要时间）
+// 解析微信服务器返回的响应文本，提取状态码和授权码，并据此更新会话的内部状态
+// (如 pending, scanned, authorized, cancelled, expired 等)。
 func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, error) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -199,6 +245,9 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 	}
 }
 
+// GetLoginBuffer 在会话已授权后，通过模拟回调 URL 触发登录流程。
+// 它会从会话的 CookieJar 中提取必要的凭证信息（如 OpenID、AccessToken），
+// 并向底层协议客户端请求获取最终的 LoginBuffer，完成登录态的建立。
 func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.LoginBufferResult, error) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -238,14 +287,19 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 	return protocol.LoginBufferResult{LoginBuffer: lb, Credentials: creds}, nil
 }
 
+// RefreshLoginBuffer 使用已有的登录凭证刷新 LoginBuffer，以延长登录态的有效期。
 func (c *Client) RefreshLoginBuffer(ctx context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
 	return c.loginBuffers.RefreshLoginBuffer(ctx, creds)
 }
 
+// DataURIJPEG 将 JPEG 图片的字节数据转换为 Base64 编码的 Data URI 字符串，
+// 便于在前端 HTML 或 JSON 响应中直接渲染图片。
 func DataURIJPEG(data []byte) string {
 	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data)
 }
 
+// parsePoll 解析微信长轮询返回的 JavaScript 文本响应，
+// 提取其中的错误码 (wx_errcode) 和授权码 (wx_code)。
 func parsePoll(text string) (*int, string) {
 	var out *int
 	if m := errRE.FindStringSubmatch(text); len(m) == 2 {
@@ -259,6 +313,8 @@ func parsePoll(text string) (*int, string) {
 	return out, code
 }
 
+// credentialsFromJar 从 HTTP CookieJar 中提取微信扫码登录回调后设置的关键凭证信息，
+// 包括 OpenID、AccessToken、RefreshToken 等，并构造为 protocol.LoginBufferCredentials 结构体。
 func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBufferCredentials, error) {
 	u, _ := url.Parse(rawURL)
 	var cookies []*http.Cookie
@@ -293,6 +349,7 @@ func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBuffer
 	}, nil
 }
 
+// defaultString 是一个辅助函数，当输入字符串 s 为空时返回默认值 def，否则返回原字符串 s。
 func defaultString(s, def string) string {
 	if s == "" {
 		return def
@@ -300,6 +357,8 @@ func defaultString(s, def string) string {
 	return s
 }
 
+// randomHex 生成指定长度 n 的随机字节序列，并将其编码为十六进制字符串，
+// 用于生成唯一的会话 ID。
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
