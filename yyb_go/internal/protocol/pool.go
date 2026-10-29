@@ -84,6 +84,7 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	}
 }
 
+// TODO: GetCode
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		hostAppID := st.Session.HostAppID
@@ -137,20 +138,34 @@ func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, pay
 }
 
 func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string) error {
-	return p.db.InvalidateSession(ctx, accountID, effectiveProxy(tcpProxy, p.cfg.TCPProxy))
+	var proxy string
+	if tcpProxy != "" {
+		proxy = tcpProxy
+	} else {
+		proxy = p.cfg.TCPProxy
+	}
+	return p.db.InvalidateSession(ctx, accountID, proxy)
 }
 
 func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
-	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
-	st, err := p.state(ctx, loginBuffer, accountID, effective)
+	// 解析可用http代理
+	var tcpproxy string
+	if tcpProxy != "" {
+		tcpproxy = tcpProxy
+	} else {
+		tcpproxy = p.cfg.TCPProxy
+	}
+
+	// 获取会话
+	st, err := p.state(ctx, loginBuffer, accountID, tcpproxy)
 	if err == nil {
 		res, err := op(ctx, st)
-		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect {
+		if err == nil || tcpproxy == "" || !p.cfg.TCPProxyFallbackDirect {
 			return res, err
 		}
-		_ = p.Invalidate(ctx, accountID, effective)
+		_ = p.Invalidate(ctx, accountID, tcpproxy)
 	}
-	if effective != "" && p.cfg.TCPProxyFallbackDirect {
+	if tcpproxy != "" && p.cfg.TCPProxyFallbackDirect {
 		st, err = p.state(ctx, loginBuffer, accountID, "")
 		if err != nil {
 			return nil, err
@@ -317,13 +332,6 @@ func release(sem chan struct{}) {
 	case <-sem:
 	default:
 	}
-}
-
-func effectiveProxy(req, def string) string {
-	if req != "" {
-		return req
-	}
-	return def
 }
 
 func sessionExpiresAt(st WmpfSession, ttl time.Duration) int64 {
