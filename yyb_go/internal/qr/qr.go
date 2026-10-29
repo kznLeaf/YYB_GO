@@ -20,6 +20,11 @@ import (
 )
 
 const (
+	oauthURL = "https://open.weixin.qq.com/connect/qrconnect" +
+		"?appid=wxd44977328b36e647" +
+		"&redirect_uri=https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX" +
+		"&response_type=code&scope=snsapi_login,snsapi_runtime_pcsdk" +
+		"&state=web&fast_login=1&self_redirect=true"
 	// 应用宝的认证和鉴权URL
 	//
 	// - 触发回调：当用户在手机上微信扫码并点击“确认登录”后，微信长轮询会返回一个临时的 AuthorizeCode
@@ -35,11 +40,6 @@ const (
 	//
 	// - 获取最终登录态：最后，代码使用这些凭证去调用底层的 FetchLoginBuffer，换取最终的 LoginBuffer
 	// （这通常是腾讯 PC 客户端内部协议用于维持长连接登录态的核心 Token）。
-	oauthURL = "https://open.weixin.qq.com/connect/qrconnect" +
-		"?appid=wxd44977328b36e647" +
-		"&redirect_uri=https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX" +
-		"&response_type=code&scope=snsapi_login,snsapi_runtime_pcsdk" +
-		"&state=web&fast_login=1&self_redirect=true"
 	callbackURL  = "https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth"
 	qrBase       = "https://open.weixin.qq.com/connect/qrcode/"
 	longPollBase = "https://long.open.weixin.qq.com/connect/l/qrconnect"
@@ -192,6 +192,7 @@ func (c *Client) FetchQRCodeImage(ctx context.Context, sess *Session) ([]byte, e
 func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, error) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+
 	if sess.LoginBuffer != "" {
 		return PollResult{Status: "confirmed"}, nil
 	}
@@ -199,24 +200,30 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		code := 405
 		return PollResult{Status: "authorized", ErrCode: &code, Code: sess.AuthorizeCode}, nil
 	}
+
 	u := longPollBase + "?" + url.Values{
 		"uuid": {sess.WXUUID},
 		"_":    {strconv.FormatInt(time.Now().UnixMilli(), 10)},
 	}.Encode()
+
 	reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return PollResult{}, err
 	}
+
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := sess.HTTPClient.Do(req)
 	if err != nil {
 		return PollResult{}, err
 	}
 	defer resp.Body.Close()
+
 	body, _ := io.ReadAll(resp.Body)
 	text := string(body)
+
 	errcode, code := parsePoll(text)
 	switch {
 	case errcode != nil && *errcode == 408:
@@ -232,7 +239,9 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		sess.Status = "expired"
 		return PollResult{Status: "expired", ErrCode: errcode, Code: code}, nil
 	case errcode != nil && *errcode == 405 && code != "":
+		// 405 Method Not Allowed
 		sess.AuthorizeCode = code
+		log.Printf("AuthorizeCode: %s\n", code)
 		sess.Status = "authorized"
 		return PollResult{Status: "authorized", ErrCode: errcode, Code: code}, nil
 	default:
@@ -251,39 +260,52 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.LoginBufferResult, error) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+
 	if sess.LoginBuffer != "" && sess.Credentials != nil {
 		return protocol.LoginBufferResult{LoginBuffer: sess.LoginBuffer, Credentials: *sess.Credentials}, nil
 	}
 	if sess.AuthorizeCode == "" {
 		return protocol.LoginBufferResult{}, fmt.Errorf("QR session is not authorized yet")
 	}
+
+	// 携带 code 访问回调URL, 以便获取Cookies
+	// cb 是拼接后的URL
 	cb := callbackURL + "?" + url.Values{
 		"login_type": {"WX"},
 		"code":       {sess.AuthorizeCode},
 		"state":      {"web"},
 	}.Encode()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cb, nil)
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
+
+	// 请求cb
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := sess.HTTPClient.Do(req)
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
+
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+
+	// 现在session已经有了cookies
 	creds, err := credentialsFromJar(sess.Jar, cb)
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
+
 	lb, err := c.loginBuffers.FetchLoginBuffer(ctx, creds)
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
+
 	sess.Credentials = &creds
 	sess.LoginBuffer = lb
 	sess.Status = "confirmed"
+
 	return protocol.LoginBufferResult{LoginBuffer: lb, Credentials: creds}, nil
 }
 
@@ -299,7 +321,7 @@ func DataURIJPEG(data []byte) string {
 }
 
 // parsePoll 解析微信长轮询返回的 JavaScript 文本响应，
-// 提取其中的错误码 (wx_errcode) 和授权码 (wx_code)。
+// 用正则提取其中的错误码 (wx_errcode) 和授权码 (wx_code)。
 func parsePoll(text string) (*int, string) {
 	var out *int
 	if m := errRE.FindStringSubmatch(text); len(m) == 2 {
@@ -321,23 +343,30 @@ func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBuffer
 	if u != nil {
 		cookies = append(cookies, jar.Cookies(u)...)
 	}
+
 	hostURL, _ := url.Parse("https://yybadaccess.3g.qq.com/")
 	cookies = append(cookies, jar.Cookies(hostURL)...)
+
+	// 将所有 cookie 保存到map
 	values := map[string]string{}
 	for _, ck := range cookies {
 		values[ck.Name] = ck.Value
 	}
+
 	openid := values["openid"]
 	accessToken := values["accesstoken"]
 	if openid == "" || accessToken == "" {
 		return protocol.LoginBufferCredentials{}, fmt.Errorf("OAuth callback did not set required cookies")
 	}
+
+	// 读取 cookie 的过期时间，如果没有就设为默认值7200
 	expiresIn := int64(7200)
 	if values["expires_in"] != "" {
 		if n, err := strconv.ParseInt(values["expires_in"], 10, 64); err == nil && n > 0 {
 			expiresIn = n
 		}
 	}
+
 	return protocol.LoginBufferCredentials{
 		OpenID:       openid,
 		AccessToken:  accessToken,
